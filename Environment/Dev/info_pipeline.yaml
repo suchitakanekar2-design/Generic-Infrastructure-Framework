@@ -1,0 +1,226 @@
+trigger: none
+
+pool: Default
+
+name: Stage Infra Pipeline
+
+stages:
+  - stage: Terraform_init_fmt_validate
+    displayName: 'Terraform Init Fmt Validate'
+    jobs:
+      - job: Terraforminit
+        steps:
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+              backendServiceArm: 'windows-svc'
+              backendAzureRmStorageAccountName: 'microdevinfrastorage1'
+              backendAzureRmContainerName: 'dev-container'
+              backendAzureRmKey: 'terraform.tfstate'
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'custom'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+              outputTo: 'console'
+              customCommand: 'fmt'
+              environmentServiceNameAzureRM: 'windows-svc'
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+
+  - stage: LintingStage
+    dependsOn: Terraform_init_fmt_validate
+    displayName: 'Linting Stage'
+    jobs:
+      - job: Lintingjob
+        steps:
+          - task: PowerShell@2
+            displayName: 'Run TFLint'
+            continueOnError: true
+            inputs:
+              targetType: 'inline'
+              script: |
+                # TFLint version
+                $TFLintVersion = "0.48.0"
+                $TFLintZip = "$env:TEMP\tflint.zip"
+                $TFLintDir = "$env:TEMP\tflint"
+                $DownloadUrl = "https://github.com/terraform-linters/tflint/releases/download/v$TFLintVersion/tflint_windows_amd64.zip"
+
+                # Download TFLint if missing
+                if (-not (Test-Path "$TFLintDir\tflint.exe")) {
+                    Write-Host "Downloading TFLint $TFLintVersion..."
+                    Invoke-WebRequest -Uri $DownloadUrl -OutFile $TFLintZip
+                    Expand-Archive -Path $TFLintZip -DestinationPath $TFLintDir -Force
+                }
+
+                # Add TFLint to PATH
+                $env:PATH += ";$TFLintDir"
+
+                # Navigate to Terraform code (update path if needed)
+                $TerraformDir = "$(System.DefaultWorkingDirectory)"  # root of repo
+                Set-Location $TerraformDir
+                Write-Host "Scanning Terraform code in $TerraformDir"
+
+                # Run TFLint
+                tflint
+              
+
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "TFLint found issues! Failing the pipeline."
+                    exit $LASTEXITCODE
+                }
+
+
+  - stage: ScanningStage
+    dependsOn: LintingStage
+    displayName: 'Scanning Stage'
+    jobs:
+      - job: Scanningjob
+        steps:
+          - task: tfsec@1
+            inputs:
+              version: 'v1.26.0'
+              dir: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+          
+          - task: PowerShell@2
+            displayName: Checkov
+            inputs:
+              targetType: 'inline'
+              script: |
+                python -m pip install --upgrade pip
+                pip install checkov
+                
+                checkov -d . --quiet
+            continueOnError: true
+
+          - task: PowerShell@2
+            displayName: 'Security Scan: TruffleHog'
+            inputs:
+              targetType: 'inline'
+              script: |
+                pip install --upgrade trufflehog
+                trufflehog --version
+                trufflehog filesystem . --no-update
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "TruffleHog detected potential secrets"
+                    exit 0
+                }
+
+
+          # - task: trivy@2
+          #   continueOnError: 
+          #   inputs:
+          #     version: 'latest'
+          #     type: 'filesystem'
+          #     target: '.'
+          #     scanners: 'vuln'
+          #     severities: 'HIGH'
+          #     reports: 'html'
+          #     publish: true
+
+  - stage: InfraCost
+    dependsOn: ScanningStage
+    displayName: Infra Cost
+    jobs:
+      - job: infracostjob
+        steps:
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+              backendServiceArm: 'windows-svc'
+              backendAzureRmStorageAccountName: 'microdevinfrastorage1'
+              backendAzureRmContainerName: 'dev-container'
+              backendAzureRmKey: 'terraform.tfstate'
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+              environmentServiceNameAzureRM: 'windows-svc'
+
+          - powershell: |
+                $env:INFRACOST_API_KEY = "ico-SRRCkjkeacpNkARoIe22IZ5OCjTXNJeJ"
+                infracost breakdown --path "tfplan" --format table --out-file infracost.txt
+            displayName: "Generate Cost Report"
+            workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+
+          - powershell: |
+                $source = "$(System.DefaultWorkingDirectory)/Environment/Dev/infracost.txt"
+                $destination = "$(Build.ArtifactStagingDirectory)/infracost.txt"
+                New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)"
+                Copy-Item $source $destination -Force
+            displayName: "Move Infracost Report to Artifact Staging Directory"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Cost Report"
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/infracost.txt'
+              ArtifactName: 'CostReport'
+              publishLocation: 'Container'
+
+  - stage: TerraformPlan
+    dependsOn: InfraCost
+    displayName: 'Terraform Plan'
+    jobs:
+      - job: Planjob
+        steps:
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+              backendServiceArm: 'windows-svc'
+              backendAzureRmStorageAccountName: 'microdevinfrastorage1'
+              backendAzureRmContainerName: 'dev-container'
+              backendAzureRmKey: 'terraform.tfstate'
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+              environmentServiceNameAzureRM: 'windows-svc'
+
+  - stage: ManualValidation
+    dependsOn: TerraformPlan
+    displayName: 'Manual Validation'
+    jobs:
+      - job: Manualvalidationjob
+        pool: server
+        steps:
+          - task: ManualValidation@1
+            inputs:
+              notifyUsers: 'suchikanekar1@gmail.com'
+              approvers: 'suchikanekar1@gmail.com'
+
+  - stage: TerraformApply
+    dependsOn: ManualValidation
+    displayName: 'Terraform apply'
+    jobs:
+      - job: applyjob
+        steps:
+        - task: TerraformTask@5
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+            backendServiceArm: 'windows-svc'
+            backendAzureRmStorageAccountName: 'microdevinfrastorage1'
+            backendAzureRmContainerName: 'dev-container'
+            backendAzureRmKey: 'terraform.tfstate'
+
+        - task: TerraformTask@5
+          inputs:
+            provider: 'azurerm'
+            command: 'apply'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/Environment/Dev'
+            environmentServiceNameAzureRM: 'windows-svc'
